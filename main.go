@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"log"
 	"os"
 	"sync"
+	"time"
 
-	"github.com/dylannz/kafka-experiment/service"
+	"github.com/dylannz/kafka-experiment/consumer"
 	"github.com/joho/godotenv"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -14,6 +16,9 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 
 	"github.com/segmentio/kafka-go"
+
+	"net/http"
+	_ "net/http/pprof"
 )
 
 const (
@@ -23,30 +28,28 @@ const (
 type Worker struct {
 	DB *mongo.Client
 
-	Collections map[string]*mongo.Collection
+	Collection *mongo.Collection
 }
 
-func (w Worker) Do(j service.Job) error {
-	// we're only interested in the value at the moment
-	tableName := j.Topic
+func (w Worker) Do(ctx context.Context, messages []kafka.Message) error {
+	docs := make([]interface{}, len(messages))
 
-	collection, ok := w.Collections[tableName]
-	if !ok {
-		// silently ignore, we're not set up to process this topic
-		return nil
+	for k, m := range messages {
+		doc := bson.D{}
+		// convert from JSON to BSON
+		// TODO: handle key as well?
+		err := bson.UnmarshalExtJSON(m.Value, true, &doc)
+		if err != nil {
+			return errors.Wrap(err, "unmarshal JSON")
+		}
+
+		docs[k] = doc
 	}
 
-	// convert from JSON to BSON
-	doc := bson.D{}
-	err := bson.UnmarshalExtJSON(j.Value, true, &doc)
+	/*res*/
+	_, err := w.Collection.InsertMany(ctx, docs)
 	if err != nil {
-		return errors.Wrap(err, "unmarshal JSON")
-	}
-
-	ctx := context.Background() // TODO: pass this in...
-	/*res*/ _, err = collection.InsertMany(ctx, []interface{}{doc}) // TODO: parse multiple documents
-	if err != nil {
-		return err
+		return errors.Wrap(err, "insert many into collection")
 	}
 
 	// res.InsertedIDs
@@ -69,6 +72,10 @@ func setLogLevel() error {
 }
 
 func main() {
+	go func() {
+		// for pprof
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
 
 	log := logrus.WithField("service", serviceName)
 
@@ -89,34 +96,13 @@ func main() {
 		log.Fatal(errors.Wrap(err, "connect to mongo"))
 	}
 
-	log.Debug("setting up worker/topics")
-	worker := Worker{
-		// insert mongo db connection here
-		DB:          db,
-		Collections: map[string]*mongo.Collection{},
-	}
+	database := db.Database(os.Getenv("MONGO_DB_NAME"))
 
-	topics := []string{"messages_delivered"}
-	for _, t := range topics {
-		worker.Collections[t] = db.Database(os.Getenv("MONGO_DB_NAME")).Collection(t)
-	}
-
-	log.Debug("creating/configuring importer...")
-	importer, err := service.NewImporter(
-		service.SetNumWorkers(5),
-		//service.SetMaxItemsPerTask(), TODO
-		service.SetLogger(log),
-		service.SetWorker(worker.Do),
-	)
-	if err != nil {
-		log.Fatal(errors.Wrap(err, "initialize importer"))
-	}
-
-	log.Debug("starting workers...")
+	log.Debug("starting consumers and workers...")
 	configs := []kafka.ReaderConfig{
 		{
-			Brokers: []string{"localhost:9092"},
-			//GroupID:  "kafka-experiment",
+			Brokers:  []string{"localhost:9092"},
+			GroupID:  "kafka-experiment_6",
 			Topic:    "messages_delivered",
 			MinBytes: 10e3, // 10KB
 			MaxBytes: 10e6, // 10MB
@@ -126,31 +112,28 @@ func main() {
 	wg := sync.WaitGroup{}
 	wg.Add(len(configs))
 	for _, c := range configs {
-		go consumeKafka(log, importer.NewJob, c)
+		worker := Worker{
+			DB:         db,
+			Collection: database.Collection(c.Topic),
+		}
+
+		c, err := consumer.NewKafkaConsumer(
+			consumer.SetReader(kafka.NewReader(c)),
+			consumer.SetWorkerFunc(worker.Do),
+			consumer.SetMessagesPerBatch(1000),
+			consumer.SetBatchTimeout(time.Second*30),
+			consumer.SetContext(ctx),
+			consumer.SetLogger(log),
+		)
+		if err != nil {
+			log.WithError(err).Fatal()
+		}
+		go func() {
+			defer wg.Done()
+			c.Consume()
+		}()
 	}
 	log.Info("Ready for messages")
 	wg.Wait()
 	log.Info("all goroutines finished, exiting...")
-}
-
-func consumeKafka(log logrus.FieldLogger, fn func(service.Job), cfg kafka.ReaderConfig) {
-	// make a new reader that consumes from topic-A
-	r := kafka.NewReader(cfg)
-
-	for {
-		m, err := r.ReadMessage(context.Background())
-		if err != nil {
-			break
-		}
-
-		log.Debugf("message at topic/partition/offset %v/%v/%v: %s = %s", m.Topic, m.Partition, m.Offset, string(m.Key), string(m.Value))
-
-		fn(service.Job{
-			Topic: m.Topic,
-			Key:   m.Key,
-			Value: m.Value,
-		})
-	}
-
-	r.Close()
 }
