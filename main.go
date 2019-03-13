@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/dylannz/kafka-experiment/consumer"
+	"github.com/dylannz-sailthru/kafka-experiment/consumer"
 	"github.com/joho/godotenv"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
